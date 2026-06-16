@@ -65,7 +65,7 @@ Este projeto está licenciado sob a Licença MIT - veja o arquivo [LICENSE](LICE
 
 ## 📧 Contato
 
-**Autor**: Vanderson Rocha de Souza  
+**Autor**: Vanderson Rodrigues de Souza  
 **GitHub**: [@vandersonr-souza](https://github.com/vandersonr-souza)
 
 ---
