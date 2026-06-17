@@ -1,5 +1,5 @@
 """
-consolidador_notas.py  [v3 — IN RFB nº 1585/2015]
+consolidador_notas.py  [v4 — IN RFB nº 1585/2015 + Custódia Inicial]
 ==================================================
 Lógica de negócios sobre notas de corretagem SINAC.
 
@@ -20,12 +20,16 @@ Correções fiscais aplicadas nesta versão
    Day Trade NÃO altera o preço médio carregado para meses seguintes.
    Somente operações 'SWING_TRADE' interagem com o livro de custódia.
 
+3. Custódia Inicial (v4)
+   Permite injetar um dicionário de posições anteriores (saldo inicial)
+   para manter a continuidade do Preço Médio entre períodos.
+
 Pipeline
 --------
     notas → ratear_taxas()
           → _classificar_trade_type()    ← Row Splitting
           → _precomputar_dt_acoes()      ← pre-cálculo DT por sessão
-          → _calcular_preco_medio_e_resultado()
+          → _calcular_preco_medio_e_resultado(df, custódia_inicial)
           → _resultado_mensal()
 """
 
@@ -34,9 +38,9 @@ import pandas as pd
 from typing import Optional
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 #  CONSTANTES
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 LIMITE_ISENCAO_SWING: float = 20_000.00   # R$ mensais — isenção ações swing
 ALIQUOTA_DAYTRADE:    float = 0.20        # 20% IR Day Trade
@@ -45,9 +49,9 @@ IRRF_DAYTRADE:        float = 0.01        # 1% IRRF retido na fonte (Day Trade)
 _RATIO_FUTURO_THRESHOLD: float = 0.05     # heurística futuros vs ações
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 #  STEP 1 — RATEIO DE TAXAS
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 def ratear_taxas(nota: dict) -> pd.DataFrame:
     """
@@ -101,9 +105,9 @@ def ratear_taxas(nota: dict) -> pd.DataFrame:
     return df
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 #  STEP 2 — CLASSIFICAÇÃO DAY TRADE / SWING TRADE  (com Row Splitting)
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 def _criar_linha_split(
     row: pd.Series,
@@ -216,9 +220,9 @@ def _classificar_trade_type(df: pd.DataFrame) -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 #  STEP 3 — PREÇO MÉDIO E RESULTADO  (com isolamento fiscal DT)
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 def _precomputar_dt_acoes(df: pd.DataFrame) -> dict:
     """
@@ -266,9 +270,25 @@ def _precomputar_dt_acoes(df: pd.DataFrame) -> dict:
 
 def _calcular_preco_medio_e_resultado(
     df: pd.DataFrame,
+    custodia_inicial: dict = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Percorre as operações em ordem cronológica aplicando as regras fiscais:
+    Percorre as operações em ordem cronológica aplicando as regras fiscais.
+
+    Parâmetros
+    ----------
+    df : pd.DataFrame
+        DataFrame de operações após classificação (Day Trade / Swing Trade).
+    custodia_inicial : dict, optional
+        Dicionário com saldo inicial de custódia.
+        Formato: {
+            'TICKER': {
+                'qty': int,
+                'avg': float,
+                'tipo_ativo': str,
+                'ultima_compra': pd.Timestamp
+            }
+        }
 
     Day Trade — ações (IN RFB nº 1585/2015)
     ----------------------------------------
@@ -300,7 +320,8 @@ def _calcular_preco_medio_e_resultado(
     sessoes_dt = _precomputar_dt_acoes(df)
 
     # Livro de posições: { ticker: { qty, avg, tipo_ativo, ultima_compra } }
-    livro: dict = {}
+    # Carrega a custódia inicial se fornecida
+    livro: dict = custodia_inicial.copy() if custodia_inicial else {}
 
     for i, row in df.iterrows():
         t     = row['ticker']
@@ -393,9 +414,9 @@ def _calcular_preco_medio_e_resultado(
     return df, df_custodia
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 #  STEP 4 — RESULTADO MENSAL + IR ESTIMADO
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 def _resultado_mensal(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -491,11 +512,14 @@ def _resultado_mensal(df: pd.DataFrame) -> pd.DataFrame:
     return agg.drop(columns=['receita_swing_acoes_mes'])
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 #  FUNÇÃO PÚBLICA
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
-def consolidar_notas(notas: list[dict]) -> dict[str, pd.DataFrame]:
+def consolidar_notas(
+    notas: list[dict],
+    custodia_inicial: dict = None,
+) -> dict[str, pd.DataFrame]:
     """
     Consolida múltiplas notas em três DataFrames analíticos.
 
@@ -503,6 +527,16 @@ def consolidar_notas(notas: list[dict]) -> dict[str, pd.DataFrame]:
     ----------
     notas : list[dict]
         Cada elemento é o retorno de `extrair_dados_nota(texto_pdf)`.
+    custodia_inicial : dict, optional
+        Saldo inicial de custódia com formato:
+        {
+            'TICKER': {
+                'qty': int,
+                'avg': float (preço médio),
+                'tipo_ativo': 'ACAO' | 'FUTURO',
+                'ultima_compra': pd.Timestamp
+            }
+        }
 
     Retorna
     -------
@@ -518,7 +552,9 @@ def consolidar_notas(notas: list[dict]) -> dict[str, pd.DataFrame]:
         [ratear_taxas(n) for n in notas], ignore_index=True
     )
     df_ops = _classificar_trade_type(df_ops)
-    df_ops, df_custodia = _calcular_preco_medio_e_resultado(df_ops)
+    df_ops, df_custodia = _calcular_preco_medio_e_resultado(
+        df_ops, custodia_inicial
+    )
     df_resultado = _resultado_mensal(df_ops)
 
     return {
@@ -526,209 +562,3 @@ def consolidar_notas(notas: list[dict]) -> dict[str, pd.DataFrame]:
         'custodia'         : df_custodia,
         'resultado_mensal' : df_resultado,
     }
-
-
-# ════════════════════════════════════════════════════════════════════════════
-#  DADOS DE TESTE
-# ════════════════════════════════════════════════════════════════════════════
-
-# Nota 1 — WIN mini-índice (futuro, day trade completo)
-NOTA_WIN = {
-    'data_pregao': '29/05/2026',
-    'operacoes': [
-        {'cv': 'C', 'ticker': 'WIN', 'quantidade': 1,
-         'preco_unitario': 173990.00, 'valor_total':  236.20, 'dc': 'C'},
-        {'cv': 'C', 'ticker': 'WIN', 'quantidade': 1,
-         'preco_unitario': 174910.00, 'valor_total':   52.20, 'dc': 'C'},
-        {'cv': 'V', 'ticker': 'WIN', 'quantidade': 1,
-         'preco_unitario': 175130.00, 'valor_total':   -8.20, 'dc': 'D'},
-        {'cv': 'V', 'ticker': 'WIN', 'quantidade': 1,
-         'preco_unitario': 175220.00, 'valor_total':    9.80, 'dc': 'C'},
-    ],
-    'total_taxas': 1.00,
-}
-
-# Nota 2 — Compra de ações swing (base para PM)
-NOTA_COMPRA_ACOES = {
-    'data_pregao': '02/06/2026',
-    'operacoes': [
-        {'cv': 'C', 'ticker': 'PETR4', 'quantidade': 100,
-         'preco_unitario': 35.50, 'valor_total': -3550.00, 'dc': 'D'},
-        {'cv': 'C', 'ticker': 'VALE3', 'quantidade':  50,
-         'preco_unitario': 65.00, 'valor_total': -3250.00, 'dc': 'D'},
-    ],
-    'total_taxas': 5.00,
-}
-
-# Nota 3 — Venda swing PETR4 + Day Trade completo ITUB4
-NOTA_VENDA_MISTA = {
-    'data_pregao': '15/06/2026',
-    'operacoes': [
-        {'cv': 'V', 'ticker': 'PETR4', 'quantidade':  50,
-         'preco_unitario': 38.00, 'valor_total':  1900.00, 'dc': 'C'},
-        {'cv': 'C', 'ticker': 'ITUB4', 'quantidade': 200,
-         'preco_unitario': 28.00, 'valor_total': -5600.00, 'dc': 'D'},
-        {'cv': 'V', 'ticker': 'ITUB4', 'quantidade': 200,
-         'preco_unitario': 28.30, 'valor_total':  5660.00, 'dc': 'C'},
-    ],
-    'total_taxas': 8.00,
-}
-
-# Nota 4 — Aporte adicional PETR4 swing (rebaixa PM)
-NOTA_APORTE = {
-    'data_pregao': '20/06/2026',
-    'operacoes': [
-        {'cv': 'C', 'ticker': 'PETR4', 'quantidade': 200,
-         'preco_unitario': 34.00, 'valor_total': -6800.00, 'dc': 'D'},
-    ],
-    'total_taxas': 3.50,
-}
-
-# Nota 5 — Day Trade PARCIAL (caso central do Row Splitting)
-# C 100 BBAS3 @ 50,00  +  V 30 BBAS3 @ 52,00
-# → dt_qty = min(100, 30) = 30
-# → Row split: DT buy (30) + SW buy (70) + DT sell (30)
-# → PM histórico = só SW buy (70 @ 50,00) → PM = 50,00
-# → resultado DT = (52,00 − 50,00) × 30 = R$ 60,00
-# Taxas = 0 para cálculo determinístico
-NOTA_PARTIAL_DT = {
-    'data_pregao': '01/07/2026',
-    'operacoes': [
-        {'cv': 'C', 'ticker': 'BBAS3', 'quantidade': 100,
-         'preco_unitario': 50.00, 'valor_total': -5000.00, 'dc': 'D'},
-        {'cv': 'V', 'ticker': 'BBAS3', 'quantidade':  30,
-         'preco_unitario': 52.00, 'valor_total':  1560.00, 'dc': 'C'},
-    ],
-    'total_taxas': 0.00,
-}
-
-
-# ════════════════════════════════════════════════════════════════════════════
-#  RUNNER DE TESTES
-# ════════════════════════════════════════════════════════════════════════════
-
-def _sep(titulo: str) -> None:
-    print(f"\n{'─' * 60}")
-    print(f"  {titulo}")
-    print(f"{'─' * 60}")
-
-
-if __name__ == '__main__':
-    pd.set_option('display.float_format', lambda x: f'{x:,.4f}')
-    pd.set_option('display.max_columns', None)
-    pd.set_option('display.width', 120)
-
-    notas = [NOTA_WIN, NOTA_COMPRA_ACOES, NOTA_VENDA_MISTA,
-             NOTA_APORTE, NOTA_PARTIAL_DT]
-    res   = consolidar_notas(notas)
-    ops   = res['operacoes']
-    cust  = res['custodia']
-    rm    = res['resultado_mensal']
-
-    # ── Exibição ────────────────────────────────────────────────────────────
-    _sep('OPERAÇÕES (após row splitting)')
-    cols = ['data_pregao', 'ticker', 'tipo_ativo', 'tipo_trade',
-            'cv', 'quantidade', 'preco_ajustado', 'resultado_bruto']
-    print(ops[cols].to_string(index=False))
-
-    _sep('CUSTÓDIA / PREÇO MÉDIO')
-    print(cust.to_string(index=False) if not cust.empty else '  (vazio)')
-
-    _sep('RESULTADO MENSAL')
-    cols_rm = ['mes', 'tipo_trade', 'tipo_ativo', 'ticker',
-               'resultado_bruto', 'isento', 'aliquota_ir', 'ir_devido']
-    print(rm[cols_rm].to_string(index=False))
-
-    # ════════════════════════════════════════════════════════════════════════
-    #  ASSERTIONS
-    # ════════════════════════════════════════════════════════════════════════
-    _sep('VALIDAÇÕES')
-
-    # ── A. BM&F WIN — futuros DT ────────────────────────────────────────────
-    win_ops = ops[ops['ticker'] == 'WIN']
-    assert len(win_ops) == 4,                    '❌ WIN: esperado 4 ops'
-    assert (win_ops['tipo_trade'] == 'DAY_TRADE').all(), '❌ WIN: todas DT'
-    pl_win = win_ops['resultado_bruto'].sum()
-    assert abs(pl_win - 289.00) < 0.02,         f'❌ WIN P&L esperado 289,00 | obtido {pl_win:.2f}'
-    print(f'✅ WIN  P&L = R$ {pl_win:.2f}  (esperado 289,00)')
-
-    # ── B. ITUB4 — Day Trade completo: resultado isolado pelos preços do dia ─
-    # resultado_correto  = (pm_v_adj − pm_c_adj) × 200  ≈ 53
-    # resultado_incorreto = (pm_v_adj − 0) × 200        ≈ 5656  (bug corrigido)
-    itub_ops     = ops[ops['ticker'] == 'ITUB4']
-    total_vol_n3 = 1900 + 5600 + 5660
-    taxa_itub_c  = 8.00 * 5600 / total_vol_n3
-    taxa_itub_v  = 8.00 * 5660 / total_vol_n3
-    pa_itub_c    = 28.00 + taxa_itub_c / 200
-    pa_itub_v    = 28.30 - taxa_itub_v / 200
-    resultado_dt_esperado = (pa_itub_v - pa_itub_c) * 200
-
-    resultado_itub = itub_ops['resultado_bruto'].sum()
-    assert abs(resultado_itub - resultado_dt_esperado) < 0.01, \
-        f'❌ ITUB4 DT resultado: esperado ≈{resultado_dt_esperado:.2f} | obtido {resultado_itub:.2f}'
-    assert resultado_itub < 200, \
-        f'❌ ITUB4 usando PM=0 (bug antigo): {resultado_itub:.2f}'
-    print(f'✅ ITUB4 DT resultado = R$ {resultado_itub:.2f}  '
-          f'(intraday; isolado do PM histórico)')
-
-    # ── C. ITUB4 — DT NÃO aparece na custódia ───────────────────────────────
-    assert 'ITUB4' not in cust['ticker'].values, \
-        '❌ ITUB4 não deve aparecer na custódia (DT completo)'
-    print('✅ ITUB4 ausente da custódia (Day Trade sem posição residual)')
-
-    # ── D. Row Splitting — BBAS3 partial DT ─────────────────────────────────
-    bbas_ops = ops[ops['ticker'] == 'BBAS3']
-    # Após split: 3 linhas físicas (DT buy 30, SW buy 70, DT sell 30)
-    assert len(bbas_ops) == 3, \
-        f'❌ BBAS3: esperado 3 linhas após split | obtido {len(bbas_ops)}'
-
-    bbas_dt = bbas_ops[bbas_ops['tipo_trade'] == 'DAY_TRADE']
-    bbas_sw = bbas_ops[bbas_ops['tipo_trade'] == 'SWING_TRADE']
-
-    assert bbas_dt[bbas_dt['cv'] == 'C']['quantidade'].iloc[0] == 30, \
-        '❌ BBAS3 DT buy qty esperado 30'
-    assert bbas_dt[bbas_dt['cv'] == 'V']['quantidade'].iloc[0] == 30, \
-        '❌ BBAS3 DT sell qty esperado 30'
-    assert bbas_sw['quantidade'].iloc[0] == 70, \
-        '❌ BBAS3 SW buy qty esperado 70'
-    print('✅ BBAS3 row split: DT-buy=30 | DT-sell=30 | SW-buy=70')
-
-    # ── E. BBAS3 DT — resultado calculado pelos preços intraday ─────────────
-    resultado_bbas3_dt = bbas_dt[bbas_dt['cv'] == 'V']['resultado_bruto'].iloc[0]
-    assert abs(resultado_bbas3_dt - 60.00) < 0.01, \
-        f'❌ BBAS3 DT resultado esperado 60,00 | obtido {resultado_bbas3_dt:.2f}'
-    print(f'✅ BBAS3 DT resultado = R$ {resultado_bbas3_dt:.2f}  '
-          f'(52,00 − 50,00) × 30')
-
-    # ── F. BBAS3 DT — NÃO altera o preço médio histórico ───────────────────
-    pm_bbas3 = cust.loc[cust['ticker'] == 'BBAS3', 'preco_medio'].iloc[0]
-    qty_bbas3 = cust.loc[cust['ticker'] == 'BBAS3', 'quantidade'].iloc[0]
-    assert abs(pm_bbas3 - 50.00) < 0.001, \
-        f'❌ BBAS3 PM esperado 50,00 (só SW buy) | obtido {pm_bbas3:.4f}'
-    assert qty_bbas3 == 70, \
-        f'❌ BBAS3 custódia: esperado 70 | obtido {qty_bbas3}'
-    print(f'✅ BBAS3 custódia: qty={qty_bbas3} PM=R${pm_bbas3:.2f}  '
-          f'(DT não alterou PM histórico)')
-
-    # ── G. Preço médio PETR4 após notas 2, 3 e 4 ───────────────────────────
-    taxa_petr4_n2 = 5.00 * (3550 / (3550 + 3250))
-    pm_petr4_n2   = 35.50 + taxa_petr4_n2 / 100
-    preco_aj_n4   = 34.00 + 3.50 / 200
-    # Após V 50 (swing), resta 50 unid; depois C 200 → PM ponderado
-    pm_esperado   = (50 * pm_petr4_n2 + 200 * preco_aj_n4) / 250
-    pm_obtido     = cust.loc[cust['ticker'] == 'PETR4', 'preco_medio'].iloc[0]
-    assert abs(pm_obtido - pm_esperado) < 0.001, \
-        f'❌ PETR4 PM esperado {pm_esperado:.4f} | obtido {pm_obtido:.4f}'
-    print(f'✅ PETR4 PM = R$ {pm_obtido:.4f}  (esperado {pm_esperado:.4f})')
-
-    # ── H. PETR4 swing — isento (vendas < R$ 20 k) ─────────────────────────
-    row_sw = rm[
-        (rm['ticker'] == 'PETR4') & (rm['tipo_trade'] == 'SWING_TRADE')
-    ]
-    assert not row_sw.empty and row_sw['isento'].iloc[0], \
-        '❌ PETR4 swing deve ser isento (vendas < R$ 20 k)'
-    print('✅ PETR4 Swing Trade ISENTO (vendas mensais < R$ 20 000)')
-
-    print(f'\n{"═" * 60}')
-    print('  ✅  Todos os asserts passaram!')
-    print(f'{"═" * 60}\n')

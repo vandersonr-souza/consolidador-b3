@@ -1,13 +1,19 @@
 """
-App.py — Consolidador Fiscal B3
+App.py — Consolidador Fiscal B3 [v2 — Threading + Custódia Inicial]
 ================================
 Interface Streamlit para processamento de notas SINAC (Clear CTVM).
 Day Trade · Mini-Índice WIN · Cálculo automático de IR / IRRF / DARF.
+
+Melhorias v2:
+• ProcessPoolExecutor → ThreadPoolExecutor (compatibilidade Streamlit)
+• Input de Custódia Inicial via st.data_editor
+• Processamento paralelo de PDFs (multi-core seguro)
 """
 
 import io
 import math
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import streamlit as st
@@ -15,9 +21,9 @@ import streamlit as st
 from extrator_nota_corretagem import extrair_dados_nota_direto
 from consolidador_notas import consolidar_notas
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 #  CONFIGURAÇÃO DA PÁGINA
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 st.set_page_config(
     page_title="Consolidador Fiscal B3",
@@ -40,9 +46,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 #  CABEÇALHO
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 st.title("📊 Consolidador Fiscal B3")
 st.caption(
@@ -52,9 +58,9 @@ st.caption(
 st.divider()
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 #  HELPERS DE EXTRAÇÃO
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 def _sem_acento(s: str) -> str:
     """Remove acentos para comparação robusta independente de encoding."""
@@ -139,10 +145,9 @@ def _processar_pdf(bytes_pdf: bytes) -> tuple[list[dict], list[str]]:
     return notas, avisos
 
 
-
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 #  GERADOR DE PLANILHA EXCEL
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 def _gerar_excel(ops: pd.DataFrame, rm: pd.DataFrame) -> bytes:
     """
@@ -159,7 +164,7 @@ def _gerar_excel(ops: pd.DataFrame, rm: pd.DataFrame) -> bytes:
 
     wb = Workbook()
 
-    # ── Estilos ──────────────────────────────────────────────────────────────
+    # ── Estilos ──────────────────────────────────────────────────────────
     H_FILL  = PatternFill("solid", start_color="1F3864")
     H_FONT  = Font(name="Arial", bold=True, color="FFFFFF", size=10)
     TOT_FILL = PatternFill("solid", start_color="D6E4F0")
@@ -285,9 +290,9 @@ def _gerar_excel(ops: pd.DataFrame, rm: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 #  UPLOAD
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 st.subheader("1 · Envio das Notas de Corretagem")
 
@@ -306,25 +311,51 @@ if not arquivos:
     st.stop()
 
 
-# ════════════════════════════════════════════════════════════════════════════
-#  PROCESSAMENTO
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
+#  CUSTÓDIA INICIAL (NOVO)
+# ════════════════════════════════════════════════════════════════════════
+
+st.subheader("2 · Custódia Inicial (Opcional)")
+st.caption("Insira o saldo e o Preço Médio de meses anteriores para Swing Trade.")
+
+# Tabela interativa para o usuário preencher o PM anterior
+df_custodia_inicial = pd.DataFrame(columns=["ticker", "tipo_ativo", "quantidade", "preco_medio"])
+custodia_input = st.data_editor(
+    df_custodia_inicial,
+    num_rows="dynamic",
+    width=None,
+    column_config={
+        "ticker": st.column_config.TextColumn("Ticker (Ex: PETR4)", required=False),
+        "tipo_ativo": st.column_config.SelectboxColumn("Tipo", options=["ACAO", "FUTURO"], default="ACAO"),
+        "quantidade": st.column_config.NumberColumn("Quantidade", min_value=1, step=1),
+        "preco_medio": st.column_config.NumberColumn("Preço Médio (R$)", format="R$ %.4f", min_value=0.01),
+    },
+)
+
+st.subheader("3 · Processamento em Lote")
+
+# ════════════════════════════════════════════════════════════════════════
+#  PROCESSAMENTO COM THREADS
+# ════════════════════════════════════════════════════════════════════════
 
 notas_extraidas: list[dict] = []
 todos_avisos:    list[str]  = []
 
-barra = st.progress(0, text="Iniciando leitura dos PDFs…")
+# Preparar inputs para as threads (nome_arquivo, bytes)
+carga_trabalho = [(arq.name, arq.read()) for arq in arquivos]
 
-for idx, arq in enumerate(arquivos):
-    barra.progress(
-        (idx + 1) / len(arquivos),
-        text=f"Lendo {arq.name}  ({idx + 1} / {len(arquivos)})",
-    )
-    novas, avisos = _processar_pdf(arq.read())
-    notas_extraidas.extend(novas)
-    todos_avisos.extend([f"**{arq.name}**: {a}" for a in avisos])
+def _processar_arquivo_thread(dados):
+    """Wrapper para ThreadPoolExecutor."""
+    nome, bts = dados
+    return _processar_pdf(bts)
 
-barra.empty()
+with st.spinner(f"Processando {len(arquivos)} PDFs em paralelo..."):
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        resultados = list(executor.map(_processar_arquivo_thread, carga_trabalho))
+        
+        for idx, (notas, avisos) in enumerate(resultados):
+            notas_extraidas.extend(notas)
+            todos_avisos.extend([f"**{carga_trabalho[idx][0]}**: {a}" for a in avisos])
 
 # Exibe avisos de extração (não são erros fatais)
 if todos_avisos:
@@ -350,12 +381,24 @@ st.success(f"🎉  **{len(validas)} pregão(ões)** consolidado(s) com sucesso!"
 st.divider()
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 #  CONSOLIDAÇÃO
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 try:
-    resultado = consolidar_notas(validas)
+    # Converter input de custódia para o formato do livro interno
+    livro_inicial = {}
+    for _, row in custodia_input.dropna(how='all').iterrows():
+        if pd.notna(row['ticker']):
+            livro_inicial[row['ticker'].upper()] = {
+                'qty': int(row['quantidade']),
+                'avg': float(row['preco_medio']),
+                'tipo_ativo': row['tipo_ativo'],
+                'ultima_compra': pd.NaT
+            }
+    
+    # Repassa a custódia inicial para o motor fiscal
+    resultado = consolidar_notas(validas, livro_inicial if livro_inicial else None)
 except Exception as exc:
     st.error(f"Erro na consolidação: {exc}")
     st.stop()
@@ -364,11 +407,11 @@ ops = resultado["operacoes"]
 rm  = resultado["resultado_mensal"]
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 #  KPIs
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
-st.subheader("2 · Resumo do Período")
+st.subheader("4 · Resumo do Período")
 
 resultado_liquido = rm["resultado_bruto"].sum()
 irrf_acumulado    = rm["irrf_fonte"].sum()
@@ -404,12 +447,12 @@ c4.metric(
 )
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 #  VEREDICTO FISCAL
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 st.divider()
-st.subheader("3 · Veredicto Fiscal")
+st.subheader("5 · Veredicto Fiscal")
 
 if ir_devido_total == 0 and resultado_liquido <= 0:
     st.success(
@@ -439,12 +482,12 @@ else:
     )
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 #  APURAÇÃO MENSAL
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 st.divider()
-st.subheader("4 · Apuração por Mês")
+st.subheader("6 · Apuração por Mês")
 
 rm_show = rm[[
     "mes", "qtd_ops", "resultado_bruto",
@@ -472,12 +515,12 @@ st.dataframe(
 )
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 #  DETALHAMENTO POR PREGÃO
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 st.divider()
-st.subheader("5 · Detalhamento por Pregão")
+st.subheader("7 · Detalhamento por Pregão")
 
 ops_dia = ops[["data_pregao", "taxa_rateada", "resultado_bruto"]].copy()
 
@@ -513,14 +556,12 @@ st.dataframe(
 )
 
 
-
-
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 #  EXPORTAR PLANILHA
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 st.divider()
-st.subheader("6 · Exportar Planilha")
+st.subheader("8 · Exportar Planilha")
 
 try:
     excel_bytes = _gerar_excel(ops, rm)
@@ -539,9 +580,9 @@ try:
 except Exception as exc:
     st.warning(f"Não foi possível gerar a planilha: {exc}")
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 #  RODAPÉ
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 st.divider()
 st.caption(
